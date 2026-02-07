@@ -7,9 +7,9 @@ import nl.siegmann.epublib.epub.EpubReader;
 import nl.siegmann.epublib.epub.EpubWriter;
 import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
+import org.jsoup.nodes.Entities;
 import org.jsoup.nodes.Node;
 import org.jsoup.nodes.TextNode;
-import org.jsoup.nodes.Entities;
 import org.jsoup.select.NodeVisitor;
 
 import java.io.FileInputStream;
@@ -18,65 +18,85 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Pattern;
 
 public class EpubProcessor {
 
-    private int totalElementsInBook = 0;
-    private int currentElementProgress = 0;
+    private final AtomicInteger totalElementsInBook = new AtomicInteger(0);
+    private final AtomicInteger currentElementProgress = new AtomicInteger(0);
     private int lastPrintedPercent = -1;
 
     private static final String DELIMITER = " ||| ";
-    private static final int BATCH_SIZE_LIMIT = 1800;
+    private static final int BATCH_SIZE_LIMIT = 1800; // Оптимальный размер пакета
+    private static final int THREAD_COUNT = 3; // 3 потока — безопасно для VPN
 
-    // СЛОВАРЬ ИСПРАВЛЕНИЙ (Только универсальные и грубые ошибки)
+    // КЕШ ДЛЯ ПЕРЕВОДА (Чтобы не бить файл при ошибках)
+    private final Map<Resource, byte[]> translatedResourcesCache = new ConcurrentHashMap<>();
+
     private static final Map<String, String> CORRECTIONS = new LinkedHashMap<>();
     static {
-        // --- 1. ИМЕНА СОБСТВЕННЫЕ ---
         CORRECTIONS.put("австралиец", "Осси");
         CORRECTIONS.put("Австралиец", "Осси");
         CORRECTIONS.put("VIX", "Викс");
         CORRECTIONS.put("Vix", "Викс");
-
-        // --- 2. ЖАНРОВЫЕ ТЕРМИНЫ ---
-        // Исправляем "subwoofer" -> "sub"
         CORRECTIONS.put("сабвуфер", "саб");
         CORRECTIONS.put("Сабвуфер", "Саб");
         CORRECTIONS.put("сабвуфера", "саба");
         CORRECTIONS.put("сабвуферу", "сабу");
         CORRECTIONS.put("сабвуфером", "сабом");
         CORRECTIONS.put("сабвуфере", "сабе");
-
-        // --- ГЕНДЕРНЫЕ ИСПРАВЛЕНИЯ УБРАНЫ (Чтобы книга была универсальной) ---
     }
 
     public void process(String inputPath, String outputPath, TranslateService service) {
         try (FileInputStream fis = new FileInputStream(inputPath)) {
-            System.out.println("⏳ Читаем книгу и считаем объем работы...");
+            System.out.println("⏳ Читаем структуру книги...");
             Book book = new EpubReader().readEpub(fis);
             List<Resource> contents = book.getContents();
 
-            totalElementsInBook = countTotalElements(contents);
-            System.out.println("Найдено фрагментов текста: " + totalElementsInBook);
-            System.out.println("--- Старт перевода (Универсальный режим) ---");
+            int total = countTotalElements(contents);
+            totalElementsInBook.set(total);
 
-            drawProgressBar(0, totalElementsInBook);
+            System.out.println("Найдено фрагментов: " + total);
+            System.out.println("🚀 Старт перевода в " + THREAD_COUNT + " потока...");
+            drawProgressBar(0, total);
+
+            ExecutorService executor = Executors.newFixedThreadPool(THREAD_COUNT);
 
             for (Resource resource : contents) {
                 if (isHtml(resource)) {
-                    translateResource(resource, service);
+                    // Запускаем задачу, которая положит результат в Cache
+                    executor.submit(() -> translateResourceAndCache(resource, service));
                 }
             }
 
-            try (FileOutputStream fos = new FileOutputStream(outputPath)) {
-                new EpubWriter().write(book, fos);
-            }
+            executor.shutdown();
+            // Ждем завершения ВСЕХ потоков
+            boolean finished = executor.awaitTermination(2, TimeUnit.HOURS);
 
-            drawProgressBar(totalElementsInBook, totalElementsInBook);
-            System.out.println("\n✅ Готово! Книга сохранена.");
+            if (finished) {
+                System.out.println("\n💾 Сборка финального файла...");
+                // Применяем переводы из кеша к книге (безопасно, в одном потоке)
+                for (Map.Entry<Resource, byte[]> entry : translatedResourcesCache.entrySet()) {
+                    entry.getKey().setData(entry.getValue());
+                }
+
+                try (FileOutputStream fos = new FileOutputStream(outputPath)) {
+                    new EpubWriter().write(book, fos);
+                }
+                drawProgressBar(total, total);
+                System.out.println("\n✅ УСПЕХ! Книга сохранена: " + outputPath);
+            } else {
+                System.err.println("\n❌ Ошибка: Время ожидания истекло.");
+            }
 
         } catch (Exception e) {
             e.printStackTrace();
+            System.err.println("\n❌ Критическая ошибка: " + e.getMessage());
         }
     }
 
@@ -92,23 +112,14 @@ public class EpubProcessor {
                 if (isHtml(resource)) {
                     String html = new String(resource.getData(), resource.getInputEncoding());
                     Document doc = Jsoup.parse(html);
-                    final int[] localCount = {0};
-                    doc.traverse(new NodeVisitor() {
-                        public void head(Node node, int depth) {
-                            if (node instanceof TextNode && ((TextNode) node).text().trim().length() > 0) {
-                                localCount[0]++;
-                            }
-                        }
-                        public void tail(Node node, int depth) {}
-                    });
-                    count += localCount[0];
+                    count += doc.select("*:not(:has(*))").size();
                 }
             }
         } catch (Exception e) { }
         return count;
     }
 
-    private void translateResource(Resource resource, TranslateService service) {
+    private void translateResourceAndCache(Resource resource, TranslateService service) {
         try {
             String encoding = resource.getInputEncoding();
             if (encoding == null) encoding = "UTF-8";
@@ -116,7 +127,7 @@ public class EpubProcessor {
             String html = new String(resource.getData(), encoding);
             Document doc = Jsoup.parse(html);
 
-            // ВАЖНО: prettyPrint(false) сохраняет оригинальные шрифты и верстку
+            // Настройки для сохранения валидного XHTML
             doc.outputSettings()
                     .syntax(Document.OutputSettings.Syntax.xml)
                     .escapeMode(Entities.EscapeMode.xhtml)
@@ -160,10 +171,11 @@ public class EpubProcessor {
                 processBatch(batchText, currentBatchNodes, service);
             }
 
-            resource.setData(doc.outerHtml().getBytes(encoding));
+            // ВАЖНО: Кладем результат в кеш, не трогая саму книгу пока что
+            translatedResourcesCache.put(resource, doc.outerHtml().getBytes(encoding));
 
         } catch (Exception e) {
-            System.err.println("Сбой в главе: " + e.getMessage());
+            System.err.println("Сбой в потоке: " + e.getMessage());
         }
     }
 
@@ -171,11 +183,11 @@ public class EpubProcessor {
         if (nodes.isEmpty()) return;
 
         String originalBigString = batchText.toString();
-        String translatedBigString = service.translate(originalBigString);
+        // Используем метод с повторами
+        String translatedBigString = service.translateWithRetry(originalBigString);
 
         if (translatedBigString == null) translatedBigString = originalBigString;
 
-        // Применяем словарь (только имена и термины)
         translatedBigString = applyCorrections(translatedBigString);
 
         String[] parts = translatedBigString.split(Pattern.quote(DELIMITER.trim()));
@@ -183,7 +195,7 @@ public class EpubProcessor {
         if (parts.length == nodes.size()) {
             for (int i = 0; i < nodes.size(); i++) {
                 String translatedPart = parts[i];
-                // Сохраняем пробелы по краям
+                // Сохраняем пробелы в начале (частая проблема при склейке)
                 if (nodes.get(i).text().startsWith(" ") && !translatedPart.startsWith(" ")) {
                     translatedPart = " " + translatedPart;
                 }
@@ -191,13 +203,10 @@ public class EpubProcessor {
                 updateProgress();
             }
         } else {
-            // Фолбэк по одному (на случай сбоя разделителя)
+            // Если склейка сломалась, переводим по одному (медленно, но точно)
             for (TextNode node : nodes) {
-                String singleTrans = service.translate(node.text());
+                String singleTrans = service.translateWithRetry(node.text());
                 singleTrans = applyCorrections(singleTrans);
-                if (node.text().startsWith(" ") && !singleTrans.startsWith(" ")) {
-                    singleTrans = " " + singleTrans;
-                }
                 node.text(singleTrans);
                 updateProgress();
             }
@@ -213,11 +222,18 @@ public class EpubProcessor {
     }
 
     private void updateProgress() {
-        currentElementProgress++;
-        int percent = (int) ((double) currentElementProgress / totalElementsInBook * 100);
-        if (percent > lastPrintedPercent) {
-            drawProgressBar(currentElementProgress, totalElementsInBook);
-            lastPrintedPercent = percent;
+        int current = currentElementProgress.incrementAndGet();
+        int total = totalElementsInBook.get();
+
+        if (total == 0) return;
+
+        int percent = (int) ((double) current / total * 100);
+        // Синхронизация вывода, чтобы консоль не моргала
+        synchronized (this) {
+            if (percent > lastPrintedPercent) {
+                drawProgressBar(current, total);
+                lastPrintedPercent = percent;
+            }
         }
     }
 
